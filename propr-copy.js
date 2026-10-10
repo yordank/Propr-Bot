@@ -166,21 +166,31 @@ async function getMyPositions() {
   return out;
 }
 
-const leverageSet = new Set();
+// Реалният лост на всяка монета в Propr. Без кодиране на пътя — като официалното SDK.
+const actualLev = {};          // coin -> лост, потвърден от Propr
+const levRetryAt = {};         // coin -> кога да опитаме пак при грешка
 async function ensureLeverage(coin) {
-  if (leverageSet.has(coin) || CFG.DRY_RUN) return;
+  if (CFG.DRY_RUN) return;
+  const want = maxLev(coin);
+  if (actualLev[coin] === want) return;
+  if (levRetryAt[coin] > Date.now()) return;
   try {
-    const cfg = await propr('GET', `/accounts/${ACCOUNT_ID}/margin-config/${encodeURIComponent(coin)}`);
+    const cfg = await propr('GET', `/accounts/${ACCOUNT_ID}/margin-config/${coin}`);
     const c = cfg.data || cfg;
-    const lev = maxLev(coin);
-    if (Number(c.leverage) !== lev || c.marginMode !== 'cross') {
-      await propr('PUT', `/accounts/${ACCOUNT_ID}/margin-config/${encodeURIComponent(c.configId)}`,
-        { exchange: 'hyperliquid', asset: coin, marginMode: 'cross', leverage: lev });
-      log(`⚙ ${coin}: leverage ${lev}x cross`);
+    actualLev[coin] = Number(c.leverage) || 1;
+    if (actualLev[coin] !== want || c.marginMode !== 'cross') {
+      await propr('PUT', `/accounts/${ACCOUNT_ID}/margin-config/${c.configId}`,
+        { exchange: 'hyperliquid', asset: coin, marginMode: 'cross', leverage: want });
+      actualLev[coin] = want;
+      log(`⚙ ${coin}: leverage ${want}x cross`);
     }
-    leverageSet.add(coin);
-  } catch (e) { log(`⚠ ${coin} leverage:`, e.message); }
+  } catch (e) {
+    levRetryAt[coin] = Date.now() + 60_000;
+    log(`⚠ ${coin} leverage (сега ${actualLev[coin] ?? '?'}x):`, e.message);
+  }
 }
+// лост за сметката на марджина: реалният, ако го знаем
+const levOf = coin => (CFG.DRY_RUN ? maxLev(coin) : (actualLev[coin] ?? 1));
 
 async function marketOrder(coin, side, positionSide, qty, reduceOnly, closePosition = false) {
   const qtyStr = qty.toFixed(szDecimals[coin] ?? 4);
@@ -204,6 +214,7 @@ let RATIO = 0, MY_CAP = 0;
 const ignored = new Set();         // IGNORE_EXISTING_POSITIONS
 const cooldown = {};               // coin -> until ms
 const paper = {};                  // DRY_RUN виртуални позиции { coin: { long, short } }
+let lastScalePct = 100;
 
 async function syncOnce() {
   const [{ pos: tgt, accountValue }, mids] = await Promise.all([getTargetPositions(), getMids()]);
@@ -223,15 +234,22 @@ async function syncOnce() {
     desired[coin] = s * RATIO;
   }
 
-  // марджин проверка: ако Propr лимитите (5x BTC/ETH, 2x др.) не стигат — мащабира надолу
+  // първо настрой лоста (5x BTC/ETH, 2x др.), после смятай марджина с реалния лост
+  for (const coin of Object.keys(desired)) await ensureLeverage(coin);
+
+  // марджин проверка: ако капиталът не стига — мащабира всички позиции надолу еднакво
   let marginNeed = 0;
-  for (const [coin, q] of Object.entries(desired)) marginNeed += Math.abs(q) * (Number(mids[coin]) || 0) / maxLev(coin);
+  for (const [coin, q] of Object.entries(desired)) marginNeed += Math.abs(q) * (Number(mids[coin]) || 0) / levOf(coin);
   const budget = MY_CAP * CFG.MARGIN_SAFETY;
   const scale = marginNeed > budget ? budget / marginNeed : 1;
   if (scale < 1) {
-    log(`⚠ нужен марджин $${marginNeed.toFixed(0)} > $${budget.toFixed(0)} — мащаб ${(scale * 100).toFixed(1)}%`);
+    const pct = Math.round(scale * 100);
+    if (pct !== lastScalePct) {
+      log(`⚠ нужен марджин $${marginNeed.toFixed(0)} > $${budget.toFixed(0)} — позициите са намалени до ${pct}%`);
+      lastScalePct = pct;
+    }
     for (const c in desired) desired[c] *= scale;
-  }
+  } else lastScalePct = 100;
 
   const coins = new Set([...Object.keys(desired), ...Object.keys(mine)]);
   for (const coin of coins) {
@@ -280,6 +298,10 @@ async function syncOnce() {
     } catch (e) {
       log(`❌ ${coin}:`, e.message);
       acted = true;
+      if (e.message.includes('insufficient_balance')) {
+        cooldown[coin] = Date.now() + 60_000;   // не спами — опитай пак след минута
+        continue;
+      }
     }
     if (acted) cooldown[coin] = Date.now() + CFG.COOLDOWN_MS;
   }
