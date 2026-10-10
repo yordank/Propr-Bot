@@ -148,9 +148,16 @@ async function setupPropr() {
 
 /** { coin: { long, short } } — Propr е hedge mode: long и short са отделни позиции */
 async function getMyPositions() {
-  const res = await propr('GET', `/accounts/${ACCOUNT_ID}/positions?status=open&limit=200`);
+  const all = [];
+  const PAGE = 20;   // същото като официалното SDK
+  for (let offset = 0; offset < 1000; offset += PAGE) {
+    const res = await propr('GET', `/accounts/${ACCOUNT_ID}/positions?status=open&limit=${PAGE}&offset=${offset}`);
+    const page = res.data || [];
+    all.push(...page);
+    if (page.length < PAGE) break;
+  }
   const out = {};
-  for (const p of res.data || []) {
+  for (const p of all) {
     const q = Number(p.quantity);
     if (!q) continue;
     out[p.asset] ??= { long: 0, short: 0 };
