@@ -1,0 +1,13 @@
+{
+  "name": "propr-copy-bot",
+  "version": "1.0.0",
+  "description": "Copies a Hyperliquid wallet's positions to a Propr account",
+  "main": "propr-copy.js",
+  "scripts": {
+    "start": "node propr-copy.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
