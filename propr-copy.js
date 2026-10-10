@@ -43,6 +43,9 @@ const CFG = {
   MY_CAPITAL: env('MY_CAPITAL', 'auto'),                 // 'auto' = startingBalance от challenge
   TARGET_CAPITAL: env('TARGET_CAPITAL', '200000'),       // число или 'auto' = текущ accountValue на таргета
   RATIO: env('RATIO', ''),                               // ако е зададен — пренебрегва горните две
+  // margin   = марджинът е в съотношение, лостът = лоста на таргета (ограничен от Propr)
+  // notional = размерът на позицията е в съотношение, лостът = максимума на Propr
+  SIZE_MODE: env('SIZE_MODE', 'margin'),
 
   DEXES: env('DEXES', ',xyz').split(','),                // '' = основни perps, 'xyz' = акции/стоки
   POLL_MS: Number(env('POLL_MS', 3000)),
@@ -104,16 +107,18 @@ async function getMids() {
 async function getTargetPositions() {
   const pos = {};
   let accountValue = 0;
+  const lev = {};
   for (const dex of CFG.DEXES) {
     const st = await hl(dex ? { type: 'clearinghouseState', user: CFG.TARGET, dex }
                             : { type: 'clearinghouseState', user: CFG.TARGET });
     accountValue += Number(st.marginSummary.accountValue);
     for (const { position: p } of st.assetPositions) {
       const s = Number(p.szi);
-      if (s !== 0) pos[p.coin] = s;
+      if (s !== 0) { pos[p.coin] = s; lev[p.coin] = Number(p.leverage?.value) || 1; }
     }
   }
-  return { pos, accountValue };
+  targetLev = lev;
+  return { pos, accountValue, lev };
 }
 
 // ───────────────────────── Propr ─────────────────────────
@@ -171,7 +176,7 @@ const actualLev = {};          // coin -> лост, потвърден от Prop
 const levRetryAt = {};         // coin -> кога да опитаме пак при грешка
 async function ensureLeverage(coin) {
   if (CFG.DRY_RUN) return;
-  const want = maxLev(coin);
+  const want = wantLev(coin);
   if (actualLev[coin] === want) return;
   if (levRetryAt[coin] > Date.now()) return;
   try {
@@ -189,8 +194,14 @@ async function ensureLeverage(coin) {
     log(`⚠ ${coin} leverage (сега ${actualLev[coin] ?? '?'}x):`, e.message);
   }
 }
+// желан лост: в margin режим = лоста на таргета, но не повече от лимита на Propr
+let targetLev = {};
+function wantLev(coin) {
+  if (CFG.SIZE_MODE === 'margin' && targetLev[coin]) return Math.min(targetLev[coin], maxLev(coin));
+  return maxLev(coin);
+}
 // лост за сметката на марджина: реалният, ако го знаем
-const levOf = coin => (CFG.DRY_RUN ? maxLev(coin) : (actualLev[coin] ?? 1));
+const levOf = coin => (CFG.DRY_RUN ? wantLev(coin) : (actualLev[coin] ?? 1));
 
 async function marketOrder(coin, side, positionSide, qty, reduceOnly, closePosition = false) {
   const qtyStr = qty.toFixed(szDecimals[coin] ?? 4);
@@ -231,7 +242,10 @@ async function syncOnce() {
   for (const [coin, s] of Object.entries(tgt)) {
     if (ignored.has(coin) || CFG.COIN_BLACKLIST.includes(coin)) continue;
     if (coin.includes(':') && !coin.startsWith('xyz:')) continue;  // Propr поддържа само xyz: HIP-3
-    desired[coin] = s * RATIO;
+    // margin режим: марджин = марджин_таргет × RATIO, с лост min(таргет, Propr)
+    //   → размер = s × RATIO × (нашия лост / неговия лост)
+    const adj = CFG.SIZE_MODE === 'margin' ? wantLev(coin) / (targetLev[coin] || 1) : 1;
+    desired[coin] = s * RATIO * adj;
   }
 
   // първо настрой лоста (5x BTC/ETH, 2x др.), после смятай марджина с реалния лост
@@ -330,7 +344,8 @@ async function main() {
   else RATIO = MY_CAP / Number(CFG.TARGET_CAPITAL);
 
   log(`Капитал: мой $${MY_CAP}  |  таргет $${accountValue.toFixed(0)} (live)  |  RATIO ${RATIO.toFixed(5)} (1:${(1 / RATIO).toFixed(1)})`);
-  log(`Таргет позиции: ${Object.entries(pos).map(([c, s]) => `${c} ${s}`).join(', ') || 'няма'}`);
+  log(`Таргет позиции: ${Object.entries(pos).map(([c, s]) => `${c} ${s} (${targetLev[c]}x → ${wantLev(c)}x)`).join(', ') || 'няма'}`);
+  log(`Режим: ${CFG.SIZE_MODE === 'margin' ? 'марджин в съотношение, лост като таргета (до лимита на Propr)' : 'размер в съотношение, максимален лост'}`);
 
   if (CFG.IGNORE_EXISTING_POSITIONS) {
     for (const c of Object.keys(pos)) ignored.add(c);
