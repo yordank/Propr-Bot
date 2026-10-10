@@ -179,20 +179,32 @@ async function ensureLeverage(coin) {
   const want = wantLev(coin);
   if (actualLev[coin] === want) return;
   if (levRetryAt[coin] > Date.now()) return;
+  let c;
   try {
     const cfg = await propr('GET', `/accounts/${ACCOUNT_ID}/margin-config/${coin}`);
-    const c = cfg.data || cfg;
+    c = cfg.data || cfg;
     actualLev[coin] = Number(c.leverage) || 1;
-    if (actualLev[coin] !== want || c.marginMode !== 'cross') {
-      await propr('PUT', `/accounts/${ACCOUNT_ID}/margin-config/${c.configId}`,
-        { exchange: 'hyperliquid', asset: coin, marginMode: 'cross', leverage: want });
-      actualLev[coin] = want;
-      log(`⚙ ${coin}: leverage ${want}x cross`);
-    }
   } catch (e) {
     levRetryAt[coin] = Date.now() + 60_000;
-    log(`⚠ ${coin} leverage (сега ${actualLev[coin] ?? '?'}x):`, e.message);
+    log(`⚠ ${coin} margin-config:`, e.message);
+    return;
   }
+  if (actualLev[coin] === want && c.marginMode === 'cross') return;
+
+  // опитай желания лост; ако Propr откаже — по-нисък (някои монети имат лимит под обявения)
+  let lastErr;
+  for (let lev = want; lev >= 1; lev--) {
+    if (lev === actualLev[coin] && c.marginMode === 'cross') break;   // вече сме на най-доброто възможно
+    try {
+      await propr('PUT', `/accounts/${ACCOUNT_ID}/margin-config/${c.configId}`,
+        { exchange: 'hyperliquid', asset: coin, marginMode: 'cross', leverage: lev });
+      actualLev[coin] = lev;
+      log(`⚙ ${coin}: leverage ${lev}x cross${lev < want ? ` (Propr не прие ${want}x)` : ''}`);
+      return;
+    } catch (e) { lastErr = e; }
+  }
+  levRetryAt[coin] = Date.now() + 10 * 60_000;   // опитай пак след 10 мин
+  if (lastErr) log(`⚠ ${coin}: лостът остава ${actualLev[coin]}x —`, lastErr.message);
 }
 // желан лост: в margin режим = лоста на таргета, но не повече от лимита на Propr
 let targetLev = {};
@@ -244,12 +256,15 @@ async function syncOnce() {
     if (coin.includes(':') && !coin.startsWith('xyz:')) continue;  // Propr поддържа само xyz: HIP-3
     // margin режим: марджин = марджин_таргет × RATIO, с лост min(таргет, Propr)
     //   → размер = s × RATIO × (нашия лост / неговия лост)
-    const adj = CFG.SIZE_MODE === 'margin' ? wantLev(coin) / (targetLev[coin] || 1) : 1;
-    desired[coin] = s * RATIO * adj;
+    desired[coin] = s * RATIO;
   }
 
-  // първо настрой лоста (5x BTC/ETH, 2x др.), после смятай марджина с реалния лост
+  // първо настрой лоста (5x BTC/ETH, 2x др.), после смятай с реалния лост
   for (const coin of Object.keys(desired)) await ensureLeverage(coin);
+  // margin режим: размерът се смята с реалния лост в Propr, за да е марджинът точно в съотношение
+  if (CFG.SIZE_MODE === 'margin') {
+    for (const coin of Object.keys(desired)) desired[coin] *= levOf(coin) / (targetLev[coin] || 1);
+  }
 
   // марджин проверка: ако капиталът не стига — мащабира всички позиции надолу еднакво
   let marginNeed = 0;
@@ -274,15 +289,18 @@ async function syncOnce() {
 
     const d = desired[coin] || 0;
     const { long: L = 0, short: S = 0 } = mine[coin] || {};
+    const why = `таргет ${tgt[coin] ?? 0} → желано ${+d.toFixed(6)}, имам long ${L} / short ${S}`;
     const dec = szDecimals[coin] ?? 4;
     let acted = false;
 
     try {
       // 1) затвори грешната страна (flip или таргетът затвори)
       if (d <= 0 && L > 0 && (d < 0 || L * px >= 1)) {
+        log(`↪ ${coin}: ${why}`);
         await marketOrder(coin, 'sell', 'long', L, true, true); bookPaper(coin, 'long', -L); acted = true;
       }
       if (d >= 0 && S > 0 && (d > 0 || S * px >= 1)) {
+        log(`↪ ${coin}: ${why}`);
         await marketOrder(coin, 'buy', 'short', S, true, true); bookPaper(coin, 'short', -S); acted = true;
       }
 
@@ -296,6 +314,7 @@ async function syncOnce() {
         const bigEnough = diffQty * px >= CFG.MIN_ORDER_USD;
         const pctChange = cur > 0 ? Math.abs(diff) / want * 100 : 100;
         if (bigEnough && pctChange >= CFG.MIN_CHANGE_PCT) {
+          log(`↪ ${coin}: ${why}`);
           if (diff > 0) {
             await marketOrder(coin, side === 'long' ? 'buy' : 'sell', side, diffQty, false);
             bookPaper(coin, side, diffQty);
