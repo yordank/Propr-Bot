@@ -56,6 +56,11 @@ const CFG = {
   IGNORE_EXISTING_POSITIONS: bool('IGNORE_EXISTING_POSITIONS', 'false'),
   COIN_BLACKLIST: env('COIN_BLACKLIST', '').split(',').map(s => s.trim()).filter(Boolean),
   DRY_RUN: bool('DRY_RUN', 'true'),
+
+  // копиране на чакащите limit ордери (Open Orders) на таргета
+  MIRROR_ORDERS: bool('MIRROR_ORDERS', 'true'),
+  ORDERS_POLL_MS: Number(env('ORDERS_POLL_MS', 9000)),   // HL лимит: ордерите са "тежка" заявка
+  MIRROR_CANCEL_ON_START: bool('MIRROR_CANCEL_ON_START', 'true'),  // изчисти старите ни ордери при старт
 };
 
 if (!CFG.PROPR_API_KEY) { console.error('Липсва PROPR_API_KEY в .env'); process.exit(1); }
@@ -208,8 +213,10 @@ async function ensureLeverage(coin) {
 }
 // желан лост: в margin режим = лоста на таргета, но не повече от лимита на Propr
 let targetLev = {};
+const orderLev = {};   // coin -> лост на таргета за монети, където има само ордер (без позиция)
+const tLevOf = coin => targetLev[coin] ?? orderLev[coin];
 function wantLev(coin) {
-  if (CFG.SIZE_MODE === 'margin' && targetLev[coin]) return Math.min(targetLev[coin], maxLev(coin));
+  if (CFG.SIZE_MODE === 'margin' && tLevOf(coin)) return Math.min(tLevOf(coin), maxLev(coin));
   return maxLev(coin);
 }
 // лост за сметката на марджина: реалният, ако го знаем
@@ -232,6 +239,198 @@ async function marketOrder(coin, side, positionSide, qty, reduceOnly, closePosit
   log(`✅ ${tag} → ${o?.status ?? '?'}${o?.averageFillPrice ? ' @ ' + o.averageFillPrice : ''}`);
 }
 
+// ───────────────────────── Open Orders (limit) ─────────────────────────
+// За всеки чакащ limit ордер на таргета държим един наш ордер в Propr:
+//   размер = оставащото количество на таргета × k (k = същото съотношение като позициите)
+// Ако нашият се изпълни първи, позицията НЕ се затваря — чакаме и неговия ("ahead").
+const mirrors = new Map();     // oid -> { oid, coin, side, positionSide, reduceOnly, px, tSz0, carried, orderId, qty, filled, open, goneAt }
+const settleUntil = {};        // coin -> ms: след промяна в ордерите на таргета изчакваме снимките да се изравнят
+const orderRetryAt = {};       // oid -> ms
+let tOrdersCache = [], tOrdersAt = 0, lastTgtPos = {};
+
+async function getTargetOrders() {
+  const out = [];
+  for (const dex of CFG.DEXES) {
+    const list = await hl(dex ? { type: 'frontendOpenOrders', user: CFG.TARGET, dex }
+                              : { type: 'frontendOpenOrders', user: CFG.TARGET });
+    out.push(...list);
+  }
+  return out;
+}
+
+async function getMyOpenOrders() {
+  const map = new Map();
+  for (const status of ['open', 'partially_filled', 'pending']) {
+    for (let offset = 0; offset < 500; offset += 20) {
+      const res = await propr('GET', `/accounts/${ACCOUNT_ID}/orders?status=${status}&limit=20&offset=${offset}`);
+      const page = res.data || [];
+      for (const o of page) map.set(o.orderId, o);
+      if (page.length < 20) break;
+    }
+  }
+  return map;
+}
+
+async function getOrder(orderId) {
+  const res = await propr('GET', `/accounts/${ACCOUNT_ID}/orders?orderId=${encodeURIComponent(orderId)}&limit=1`);
+  return (res.data || [])[0] || null;
+}
+
+const OPEN_ST = ['pending', 'open', 'partially_filled'];
+
+/** отказва наш ордер; връща крайното изпълнено количество */
+async function cancelMirror(r, why) {
+  if (!r.open) return;
+  r.open = false;
+  if (CFG.DRY_RUN) { log(`🧪 DRY CANCEL ${r.coin} limit ${r.side} ${r.qty} @ ${r.px} (${why})`); return; }
+  try {
+    const res = await propr('POST', `/accounts/${ACCOUNT_ID}/orders/${r.orderId}/cancel`);
+    const o = res?.data?.[0] ?? res?.data ?? res;
+    if (o?.cumulativeQuantity !== undefined) r.filled = Number(o.cumulativeQuantity) || 0;
+    log(`✖ ${r.coin}: отказан limit ${r.side} ${r.qty} @ ${r.px} (${why})`);
+  } catch (e) {
+    // 400 = вече изпълнен/отказан
+    const o = await getOrder(r.orderId).catch(() => null);
+    if (o) r.filled = Number(o.cumulativeQuantity) || 0;
+  }
+}
+
+async function placeMirror(r, qty) {
+  const dec = szDecimals[r.coin] ?? 4;
+  const qtyStr = qty.toFixed(dec);
+  const tag = `${r.coin}: limit ${r.side.toUpperCase()} ${qtyStr} @ ${r.px} (${r.positionSide}${r.reduceOnly ? ', reduce' : ''})`;
+  r.qty = Number(qtyStr); r.filled = 0; r.open = true;
+  if (CFG.DRY_RUN) { r.orderId = 'dry-' + r.oid; log(`🧪 DRY 📌 ${tag}`); return; }
+  await ensureLeverage(r.coin);
+  const res = await propr('POST', `/accounts/${ACCOUNT_ID}/orders`, {
+    orders: [{
+      accountId: ACCOUNT_ID, intentId: ulid(), exchange: 'hyperliquid',
+      type: 'limit', side: r.side, positionSide: r.positionSide, productType: 'perp', timeInForce: 'GTC',
+      asset: r.coin, base: r.coin, quote: 'USDC', quantity: qtyStr, price: String(r.px),
+      reduceOnly: r.reduceOnly, closePosition: false,
+    }],
+  });
+  const o = res?.data?.[0];
+  r.orderId = o?.orderId;
+  if (!r.orderId) { r.open = false; throw new Error('няма orderId в отговора'); }
+  log(`📌 ${tag} → ${o.status}`);
+}
+
+/** колко сме "напред" спрямо таргета по ордерите на тази монета (нето, + = long) */
+function aheadNet(coin, tMap, kOf) {
+  let net = 0;
+  for (const r of mirrors.values()) {
+    if (r.coin !== coin) continue;
+    const t = tMap.get(r.oid);
+    const tFilled = r.tSz0 - (t ? Number(t.sz) : 0);   // изчезнал ордер = приемаме, че е изпълнен
+    const a = r.carried + r.filled - kOf(coin) * tFilled;
+    if (a > 0) net += (r.side === 'buy' ? 1 : -1) * a;
+  }
+  return net;
+}
+function aheadOf(r, t, k) {
+  return Math.max(0, r.carried + r.filled - k * (r.tSz0 - (t ? Number(t.sz) : 0)));
+}
+
+/** обнови статуса на нашите ордери (изпълнени ли са) */
+async function refreshMirrorFills() {
+  const live = [...mirrors.values()].filter(r => r.open && r.orderId);
+  if (!live.length || CFG.DRY_RUN) return;
+  const myOpen = await getMyOpenOrders();
+  for (const r of live) {
+    let o = myOpen.get(r.orderId);
+    if (!o) o = await getOrder(r.orderId).catch(() => null);
+    if (!o) continue;
+    r.filled = Number(o.cumulativeQuantity) || 0;
+    if (!OPEN_ST.includes(o.status)) {
+      r.open = false;
+      if (r.filled > 0) log(`🎯 ${r.coin}: limit ${r.side} @ ${r.px} изпълнен (${r.filled})`);
+      else log(`· ${r.coin}: limit ${r.side} @ ${r.px} → ${o.status}`);
+    }
+  }
+}
+
+/** поддържа нашите ордери = ордерите на таргета × k */
+async function syncOrders(tOrders, tMap, tgt, kOf) {
+  const now = Date.now();
+
+  // 1) ордери, които таргетът вече няма → отказваме нашия; записа пазим 5 сек.
+  for (const r of [...mirrors.values()]) {
+    if (tMap.has(r.oid)) continue;
+    if (!r.goneAt) {
+      r.goneAt = now;
+      settleUntil[r.coin] = now + 5000;
+      await cancelMirror(r, 'таргетът го няма');
+    } else if (now - r.goneAt > 5000) mirrors.delete(r.oid);
+  }
+
+  // 2) нови / променени ордери
+  for (const t of tOrders) {
+    if (t.isTrigger || t.orderType !== 'Limit') continue;        // TP/SL не копираме — позицията се хваща от синхронизацията
+    const coin = t.coin;
+    if (ignored.has(coin) || CFG.COIN_BLACKLIST.includes(coin)) continue;
+    if (coin.includes(':') && !coin.startsWith('xyz:')) continue;
+    if (szDecimals[coin] === undefined) continue;
+    if (orderRetryAt[t.oid] > now) continue;
+    const k = kOf(coin);
+    if (!k) continue;
+
+    const side = t.side === 'B' ? 'buy' : 'sell';
+    const dir = side === 'buy' ? 1 : -1;
+    const tPos = tgt[coin] || 0;
+    const reduce = !!t.reduceOnly || (tPos !== 0 && Math.sign(tPos) !== dir);
+    if (reduce && tPos === 0) continue;
+    const positionSide = reduce ? (dir > 0 ? 'short' : 'long') : (dir > 0 ? 'long' : 'short');
+    const px = t.limitPx;
+    const dec = szDecimals[coin];
+
+    let r = mirrors.get(t.oid);
+    const prevSz = r ? r.lastTSz : null;
+    if (r && prevSz !== undefined && Number(t.sz) !== prevSz) settleUntil[coin] = now + 5000;   // частично изпълнен
+
+    const ahead = r ? aheadOf(r, t, k) : 0;
+    const wantRem = roundDown(Math.max(0, k * Number(t.sz) - ahead), dec);
+    const curRem = r && r.open ? Math.max(0, r.qty - r.filled) : 0;
+    const okSize = wantRem * Number(px) >= CFG.MIN_ORDER_USD;
+
+    try {
+      if (!r) {
+        r = { oid: t.oid, coin, side, positionSide, reduceOnly: reduce, px, tSz0: Number(t.sz), carried: 0,
+              orderId: null, qty: 0, filled: 0, open: false, goneAt: null, lastTSz: Number(t.sz) };
+        mirrors.set(t.oid, r);
+        if (!okSize) { log(`· ${coin}: limit ${side} @ ${px} → $${(wantRem * Number(px)).toFixed(2)} < MIN_ORDER_USD — пропуск`); continue; }
+        await placeMirror(r, wantRem);
+        continue;
+      }
+      r.lastTSz = Number(t.sz);
+
+      const pxChanged = String(r.px) !== String(px);
+      const diff = Math.abs(wantRem - curRem);
+      const sizeChanged = diff * Number(px) >= CFG.MIN_ORDER_USD && diff / Math.max(wantRem, curRem, 1e-12) * 100 >= CFG.MIN_CHANGE_PCT;
+      if (!pxChanged && !sizeChanged && r.positionSide === positionSide) continue;
+
+      // смяна: откажи стария, запази колко сме напред, сложи нов
+      await cancelMirror(r, pxChanged ? 'нова цена' : 'нов размер');
+      r.carried = aheadOf(r, t, k);
+      r.tSz0 = Number(t.sz); r.filled = 0; r.qty = 0;
+      r.px = px; r.side = side; r.positionSide = positionSide; r.reduceOnly = reduce;
+      const rem = roundDown(Math.max(0, k * Number(t.sz) - r.carried), dec);
+      if (rem * Number(px) >= CFG.MIN_ORDER_USD) await placeMirror(r, rem);
+    } catch (e) {
+      log(`❌ ${coin} limit ${side} @ ${px}:`, e.message);
+      orderRetryAt[t.oid] = now + (e.message.includes('insufficient_balance') ? 60_000 : 5 * 60_000);
+    }
+  }
+}
+
+async function cancelAllMyOrders() {
+  const open = await getMyOpenOrders();
+  for (const o of open.values()) {
+    try { await propr('POST', `/accounts/${ACCOUNT_ID}/orders/${o.orderId}/cancel`); } catch {}
+  }
+  if (open.size) log(`✖ отказани ${open.size} стари ордера в Propr`);
+}
+
 // ───────────────────────── sync ─────────────────────────
 let RATIO = 0, MY_CAP = 0;
 const ignored = new Set();         // IGNORE_EXISTING_POSITIONS
@@ -242,6 +441,28 @@ let lastScalePct = 100;
 async function syncOnce() {
   const [{ pos: tgt, accountValue }, mids] = await Promise.all([getTargetPositions(), getMids()]);
   const mine = CFG.DRY_RUN ? paper : await getMyPositions();
+
+  // ордерите на таргета: на всеки ORDERS_POLL_MS, или веднага щом се промени позиция с наш ордер
+  let tOrders = tOrdersCache;
+  if (CFG.MIRROR_ORDERS) {
+    const mirrorCoins = new Set([...mirrors.values()].map(r => r.coin));
+    const posMoved = [...mirrorCoins].some(c => (tgt[c] || 0) !== (lastTgtPos[c] || 0));
+    if (posMoved || Date.now() - tOrdersAt >= CFG.ORDERS_POLL_MS) {
+      tOrders = tOrdersCache = await getTargetOrders();
+      tOrdersAt = Date.now();
+    }
+    lastTgtPos = { ...tgt };
+    await refreshMirrorFills();
+    // лост на таргета за монети само с ордер (нужен в margin режим)
+    if (CFG.SIZE_MODE === 'margin') {
+      for (const c of new Set(tOrders.map(o => o.coin))) {
+        if (targetLev[c] || orderLev[c]) continue;
+        try { orderLev[c] = Number((await hl({ type: 'activeAssetData', user: CFG.TARGET, coin: c })).leverage?.value) || 1; }
+        catch { orderLev[c] = 1; }
+      }
+    }
+  }
+  const tMap = new Map(tOrders.filter(o => !o.isTrigger && o.orderType === 'Limit').map(o => [o.oid, o]));
 
   // при auto target capital — ratio следва капитала на таргета
   if (!CFG.RATIO && CFG.TARGET_CAPITAL === 'auto' && accountValue > 0) RATIO = MY_CAP / accountValue;
@@ -280,16 +501,28 @@ async function syncOnce() {
     for (const c in desired) desired[c] *= scale;
   } else lastScalePct = 100;
 
-  const coins = new Set([...Object.keys(desired), ...Object.keys(mine)]);
+  // k = колко от таргета копираме за тази монета (за ордерите)
+  const kOf = coin => {
+    if (tgt[coin] && desired[coin] !== undefined) return desired[coin] / tgt[coin];
+    const adj = CFG.SIZE_MODE === 'margin' ? levOf(coin) / (tLevOf(coin) || 1) : 1;
+    return RATIO * adj * scale;
+  };
+
+  // ако наш limit се е изпълнил преди неговия — не го затваряме
+  const ahead = {};
+  if (CFG.MIRROR_ORDERS) for (const r of mirrors.values()) ahead[r.coin] ??= aheadNet(r.coin, tMap, kOf);
+
+  const coins = new Set([...Object.keys(desired), ...Object.keys(mine), ...Object.keys(ahead)]);
   for (const coin of coins) {
     if (cooldown[coin] > Date.now()) continue;
+    if (settleUntil[coin] > Date.now()) continue;
     if (ignored.has(coin) || CFG.COIN_BLACKLIST.includes(coin)) continue;
     const px = Number(mids[coin]);
     if (!px) continue;
 
-    const d = desired[coin] || 0;
+    const d = (desired[coin] || 0) + (ahead[coin] || 0);
     const { long: L = 0, short: S = 0 } = mine[coin] || {};
-    const why = `таргет ${tgt[coin] ?? 0} → желано ${+d.toFixed(6)}, имам long ${L} / short ${S}`;
+    const why = `таргет ${tgt[coin] ?? 0} → желано ${+d.toFixed(6)}${ahead[coin] ? ` (вкл. ${+ahead[coin].toFixed(6)} от limit)` : ''}, имам long ${L} / short ${S}`;
     const dec = szDecimals[coin] ?? 4;
     let acted = false;
 
@@ -338,6 +571,8 @@ async function syncOnce() {
     }
     if (acted) cooldown[coin] = Date.now() + CFG.COOLDOWN_MS;
   }
+
+  if (CFG.MIRROR_ORDERS) await syncOrders(tOrders, tMap, tgt, kOf);
 }
 
 function bookPaper(coin, side, dq) {
@@ -365,6 +600,11 @@ async function main() {
   log(`Капитал: мой $${MY_CAP}  |  таргет $${accountValue.toFixed(0)} (live)  |  RATIO ${RATIO.toFixed(5)} (1:${(1 / RATIO).toFixed(1)})`);
   log(`Таргет позиции: ${Object.entries(pos).map(([c, s]) => `${c} ${s} (${targetLev[c]}x → ${wantLev(c)}x)`).join(', ') || 'няма'}`);
   log(`Режим: ${CFG.SIZE_MODE === 'margin' ? 'марджин в съотношение, лост като таргета (до лимита на Propr)' : 'размер в съотношение, максимален лост'}`);
+
+  if (CFG.MIRROR_ORDERS) {
+    log(`Open Orders: копират се limit ордерите на таргета (на всеки ${CFG.ORDERS_POLL_MS / 1000}s)`);
+    if (CFG.MIRROR_CANCEL_ON_START && !CFG.DRY_RUN) await cancelAllMyOrders();
+  }
 
   if (CFG.IGNORE_EXISTING_POSITIONS) {
     for (const c of Object.keys(pos)) ignored.add(c);
