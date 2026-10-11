@@ -61,6 +61,7 @@ const CFG = {
   MIRROR_ORDERS: bool('MIRROR_ORDERS', 'true'),
   ORDERS_POLL_MS: Number(env('ORDERS_POLL_MS', 9000)),   // HL лимит: ордерите са "тежка" заявка
   MIRROR_CANCEL_ON_START: bool('MIRROR_CANCEL_ON_START', 'true'),  // изчисти старите ни ордери при старт
+  ORDERS_MAX_DIST_PCT: Number(env('ORDERS_MAX_DIST_PCT', 0)),       // 0 = всички; напр. 10 = само до 10% от цената
 };
 
 if (!CFG.PROPR_API_KEY) { console.error('Липсва PROPR_API_KEY в .env'); process.exit(1); }
@@ -144,14 +145,32 @@ async function propr(method, p, body) {
 
 let ACCOUNT_ID = CFG.PROPR_ACCOUNT_ID;
 let leverageLimits = { defaultMax: 2, overrides: {} };
-const maxLev = coin => leverageLimits.overrides[coin] ?? leverageLimits.defaultMax;
+// Propr е сменял формата на отговора — четем го гъвкаво; без данни = 2x (безопасно)
+function parseLevLimits(raw) {
+  const d = raw?.data ?? raw ?? {};
+  const def = Number(d.defaultMax ?? d.default ?? d.defaultMaxLeverage ?? d.maxLeverage ?? d.max);
+  const ovr = d.overrides ?? d.assets ?? d.perAsset ?? {};
+  const overrides = {};
+  if (Array.isArray(ovr)) for (const o of ovr) overrides[o.asset ?? o.coin ?? o.symbol] = Number(o.maxLeverage ?? o.leverage ?? o.max);
+  else for (const [k, v] of Object.entries(ovr)) overrides[k] = Number(typeof v === 'object' ? (v.maxLeverage ?? v.leverage ?? v.max) : v);
+  return { defaultMax: def > 0 ? def : 2, overrides };
+}
+const maxLev = coin => {
+  const v = leverageLimits.overrides[coin];
+  return v > 0 ? v : (leverageLimits.defaultMax > 0 ? leverageLimits.defaultMax : 2);
+};
 
 async function setupPropr() {
   const attempts = (await propr('GET', '/challenge-attempts?status=active')).data || [];
   const att = ACCOUNT_ID ? attempts.find(a => a.accountId === ACCOUNT_ID) : attempts[0];
   if (!att && !ACCOUNT_ID) throw new Error('Няма активен challenge в Propr');
   if (att) ACCOUNT_ID = att.accountId;
-  try { leverageLimits = await propr('GET', '/leverage-limits/effective'); } catch (e) { log('⚠ leverage limits:', e.message); }
+  try {
+    const raw = await propr('GET', '/leverage-limits/effective');
+    leverageLimits = parseLevLimits(raw);
+    log(`Лимити за лоста: по подразбиране ${leverageLimits.defaultMax}x, ${Object.entries(leverageLimits.overrides).map(([k, v]) => `${k} ${v}x`).join(', ') || '—'}`);
+    if (!(Number((raw?.data ?? raw)?.defaultMax) > 0)) log('  (суров отговор:', JSON.stringify(raw).slice(0, 300) + ')');
+  } catch (e) { log('⚠ leverage limits:', e.message); }
   const startBal = att?.currentPhase?.startingBalance ?? att?.phases?.find(p => p.status === 'active')?.startingBalance;
   return startBal ? Number(startBal) : null;
 }
@@ -178,6 +197,7 @@ async function getMyPositions() {
 
 // Реалният лост на всяка монета в Propr. Без кодиране на пътя — като официалното SDK.
 const actualLev = {};          // coin -> лост, потвърден от Propr
+const marginModeOf = {};       // coin -> cross / isolated, потвърден от Propr
 const levRetryAt = {};         // coin -> кога да опитаме пак при грешка
 async function ensureLeverage(coin) {
   if (CFG.DRY_RUN) return;
@@ -194,19 +214,25 @@ async function ensureLeverage(coin) {
     log(`⚠ ${coin} margin-config:`, e.message);
     return;
   }
-  if (actualLev[coin] === want && c.marginMode === 'cross') return;
+  let mode = marginModeOf[coin] ?? (coin.includes(':') ? 'isolated' : 'cross');
+  if (actualLev[coin] === want && c.marginMode === mode) return;
 
   // опитай желания лост; ако Propr откаже — по-нисък (някои монети имат лимит под обявения)
-  let lastErr;
+  let lastErr, triedOther = false;
   for (let lev = want; lev >= 1; lev--) {
-    if (lev === actualLev[coin] && c.marginMode === 'cross') break;   // вече сме на най-доброто възможно
+    if (lev === actualLev[coin] && c.marginMode === mode) break;   // вече сме на най-доброто възможно
     try {
       await propr('PUT', `/accounts/${ACCOUNT_ID}/margin-config/${c.configId}`,
-        { exchange: 'hyperliquid', asset: coin, marginMode: 'cross', leverage: lev });
-      actualLev[coin] = lev;
-      log(`⚙ ${coin}: leverage ${lev}x cross${lev < want ? ` (Propr не прие ${want}x)` : ''}`);
+        { exchange: 'hyperliquid', asset: coin, marginMode: mode, leverage: lev });
+      actualLev[coin] = lev; marginModeOf[coin] = mode;
+      log(`⚙ ${coin}: leverage ${lev}x ${mode}${lev < want ? ` (Propr не прие ${want}x)` : ''}`);
       return;
-    } catch (e) { lastErr = e; }
+    } catch (e) {
+      lastErr = e;
+      if (e.message.includes('invalid_margin_mode') && !triedOther) {   // напр. xyz: е само isolated
+        triedOther = true; mode = mode === 'cross' ? 'isolated' : 'cross'; lev++; continue;
+      }
+    }
   }
   levRetryAt[coin] = Date.now() + 10 * 60_000;   // опитай пак след 10 мин
   if (lastErr) log(`⚠ ${coin}: лостът остава ${actualLev[coin]}x —`, lastErr.message);
@@ -351,7 +377,10 @@ async function refreshMirrorFills() {
 }
 
 /** поддържа нашите ордери = ордерите на таргета × k */
-async function syncOrders(tOrders, tMap, tgt, kOf) {
+/** поддържа нашите ордери = ордерите на таргета × k, в рамките на свободния марджин */
+let orderBackoffUntil = 0, lastWaitingKey = '';
+const smallSkipped = new Set();
+async function syncOrders(tOrders, tMap, tgt, kOf, mine, mids) {
   const now = Date.now();
 
   // 1) ордери, които таргетът вече няма → отказваме нашия; записа пазим 5 сек.
@@ -363,18 +392,36 @@ async function syncOrders(tOrders, tMap, tgt, kOf) {
       await cancelMirror(r, 'таргетът го няма');
     } else if (now - r.goneAt > 5000) mirrors.delete(r.oid);
   }
+  for (const oid of [...smallSkipped]) if (!tMap.has(oid)) smallSkipped.delete(oid);
 
-  // 2) нови / променени ордери
+  // 2) свободен марджин = бюджет − позиции − нашите чакащи ордери (reduce ордерите не заемат марджин)
+  const mOf = (coin, qty, px) => Math.abs(qty) * Number(px) / levOf(coin);
+  let used = 0;
+  for (const [coin, p] of Object.entries(mine)) used += mOf(coin, (p.long || 0) + (p.short || 0), mids[coin] || 0);
+  for (const r of mirrors.values()) if (r.open && !r.reduceOnly) used += mOf(r.coin, r.qty - r.filled, r.px);
+  let free = MY_CAP * CFG.MARGIN_SAFETY - used;
+
+  // 3) кандидати: първо вече сложените (да не ги разместваме), после новите — най-близките до цената първи
+  const cands = [];
   for (const t of tOrders) {
     if (t.isTrigger || t.orderType !== 'Limit') continue;        // TP/SL не копираме — позицията се хваща от синхронизацията
     const coin = t.coin;
     if (ignored.has(coin) || CFG.COIN_BLACKLIST.includes(coin)) continue;
     if (coin.includes(':') && !coin.startsWith('xyz:')) continue;
     if (szDecimals[coin] === undefined) continue;
-    if (orderRetryAt[t.oid] > now) continue;
+    if (orderRetryAt[t.oid] > now || smallSkipped.has(t.oid)) continue;
+    const mid = Number(mids[coin]);
+    const dist = mid ? Math.abs(Number(t.limitPx) - mid) / mid * 100 : 1e9;
+    if (CFG.ORDERS_MAX_DIST_PCT > 0 && dist > CFG.ORDERS_MAX_DIST_PCT && !mirrors.has(t.oid)) continue;
+    cands.push({ t, dist, existing: mirrors.has(t.oid) });
+  }
+  cands.sort((a, b) => (b.existing - a.existing) || (a.dist - b.dist));
+
+  const waiting = [];
+  for (const { t } of cands) {
+    const coin = t.coin;
     const k = kOf(coin);
     if (!k) continue;
-
     const side = t.side === 'B' ? 'buy' : 'sell';
     const dir = side === 'buy' ? 1 : -1;
     const tPos = tgt[coin] || 0;
@@ -385,21 +432,25 @@ async function syncOrders(tOrders, tMap, tgt, kOf) {
     const dec = szDecimals[coin];
 
     let r = mirrors.get(t.oid);
-    const prevSz = r ? r.lastTSz : null;
-    if (r && prevSz !== undefined && Number(t.sz) !== prevSz) settleUntil[coin] = now + 5000;   // частично изпълнен
+    if (r && r.lastTSz !== undefined && Number(t.sz) !== r.lastTSz) settleUntil[coin] = now + 5000;   // частично изпълнен
 
     const ahead = r ? aheadOf(r, t, k) : 0;
     const wantRem = roundDown(Math.max(0, k * Number(t.sz) - ahead), dec);
     const curRem = r && r.open ? Math.max(0, r.qty - r.filled) : 0;
-    const okSize = wantRem * Number(px) >= CFG.MIN_ORDER_USD;
+    const needM = reduce ? 0 : mOf(coin, wantRem, px);
 
     try {
       if (!r) {
+        if (wantRem * Number(px) < CFG.MIN_ORDER_USD) {
+          smallSkipped.add(t.oid);
+          log(`· ${coin}: limit ${side} @ ${px} → $${(wantRem * Number(px)).toFixed(2)} < MIN_ORDER_USD — пропуск`);
+          continue;
+        }
+        if (!reduce && (needM > free || orderBackoffUntil > now)) { waiting.push(`${coin} ${side} @ ${px}`); continue; }
         r = { oid: t.oid, coin, side, positionSide, reduceOnly: reduce, px, tSz0: Number(t.sz), carried: 0,
               orderId: null, qty: 0, filled: 0, open: false, goneAt: null, lastTSz: Number(t.sz) };
-        mirrors.set(t.oid, r);
-        if (!okSize) { log(`· ${coin}: limit ${side} @ ${px} → $${(wantRem * Number(px)).toFixed(2)} < MIN_ORDER_USD — пропуск`); continue; }
         await placeMirror(r, wantRem);
+        mirrors.set(t.oid, r); free -= needM;
         continue;
       }
       r.lastTSz = Number(t.sz);
@@ -410,16 +461,38 @@ async function syncOrders(tOrders, tMap, tgt, kOf) {
       if (!pxChanged && !sizeChanged && r.positionSide === positionSide) continue;
 
       // смяна: откажи стария, запази колко сме напред, сложи нов
+      if (r.open && !r.reduceOnly) free += mOf(coin, curRem, r.px);
       await cancelMirror(r, pxChanged ? 'нова цена' : 'нов размер');
       r.carried = aheadOf(r, t, k);
       r.tSz0 = Number(t.sz); r.filled = 0; r.qty = 0;
       r.px = px; r.side = side; r.positionSide = positionSide; r.reduceOnly = reduce;
       const rem = roundDown(Math.max(0, k * Number(t.sz) - r.carried), dec);
-      if (rem * Number(px) >= CFG.MIN_ORDER_USD) await placeMirror(r, rem);
+      const need2 = reduce ? 0 : mOf(coin, rem, px);
+      if (rem * Number(px) < CFG.MIN_ORDER_USD) continue;
+      if (need2 > free) { waiting.push(`${coin} ${side} @ ${px}`); continue; }
+      await placeMirror(r, rem); free -= need2;
     } catch (e) {
+      if (e.message.includes('insufficient_balance')) {
+        // Propr няма повече свободен марджин — спираме новите ордери за минута, без спам
+        orderBackoffUntil = now + 60_000;
+        waiting.push(`${coin} ${side} @ ${px}`);
+        if (r && !r.open) mirrors.delete(t.oid);
+        free = 0;
+        continue;
+      }
       log(`❌ ${coin} limit ${side} @ ${px}:`, e.message);
-      orderRetryAt[t.oid] = now + (e.message.includes('insufficient_balance') ? 60_000 : 5 * 60_000);
+      orderRetryAt[t.oid] = now + 5 * 60_000;
+      if (r && !r.open && !r.filled) mirrors.delete(t.oid);
     }
+  }
+
+  // едно обобщение вместо десетки грешки — само когато се промени
+  const key = waiting.length ? `${waiting.length}|${waiting[0]}` : '';
+  if (key !== lastWaitingKey) {
+    lastWaitingKey = key;
+    const placed = [...mirrors.values()].filter(r => r.open).length;
+    if (waiting.length) log(`⏸ ${waiting.length} ордера чакат свободен марджин (сложени: ${placed}, следващ: ${waiting[0]})`);
+    else log(`✓ всички ордери на таргета са копирани (${placed})`);
   }
 }
 
@@ -572,7 +645,7 @@ async function syncOnce() {
     if (acted) cooldown[coin] = Date.now() + CFG.COOLDOWN_MS;
   }
 
-  if (CFG.MIRROR_ORDERS) await syncOrders(tOrders, tMap, tgt, kOf);
+  if (CFG.MIRROR_ORDERS) await syncOrders(tOrders, tMap, tgt, kOf, mine, mids);
 }
 
 function bookPaper(coin, side, dq) {
